@@ -3249,6 +3249,70 @@ class GatewayRunner:
         return mode
 
     @staticmethod
+    def _load_background_notification_target() -> str:
+        """Optional target override for process watcher notifications."""
+        raw = os.getenv("HERMES_BACKGROUND_NOTIFICATION_TARGET", "").strip()
+        if raw:
+            return raw
+        cfg = _load_gateway_runtime_config()
+        return str(cfg_get(cfg, "display", "background_process_notification_target", default="") or "").strip()
+
+    def _resolve_background_notification_target(
+        self,
+        *,
+        platform_name: str,
+        chat_id: str,
+        thread_id: str | None,
+    ) -> tuple[str, str, str | None]:
+        """Return configured process-notification destination or original route."""
+        target = self._load_background_notification_target()
+        if not target:
+            return platform_name, chat_id, thread_id
+        try:
+            from tools.send_message_tool import _parse_target_ref
+            platform, rest = target.split(":", 1)
+            platform = platform.strip().lower()
+            parsed_chat, parsed_thread, is_explicit = _parse_target_ref(platform, rest.strip())
+            if not is_explicit:
+                from gateway.channel_directory import resolve_channel_name
+                resolved = resolve_channel_name(platform, rest.strip())
+                if resolved:
+                    parsed_chat, parsed_thread, _ = _parse_target_ref(platform, resolved)
+            if parsed_chat:
+                return platform, parsed_chat, parsed_thread
+        except Exception:
+            logger.warning(
+                "Invalid background_process_notification_target %r; using original route",
+                target,
+            )
+        return platform_name, chat_id, thread_id
+
+    def _build_background_notification_source(
+        self,
+        *,
+        original_source: SessionSource | None,
+        platform_name: str,
+        chat_id: str,
+        thread_id: str | None,
+        user_id: str | None = None,
+        user_name: str | None = None,
+    ) -> SessionSource | None:
+        try:
+            platform = Platform(platform_name)
+        except Exception:
+            return None
+        chat_type = "group" if thread_id or str(chat_id).startswith("-") else "dm"
+        return SessionSource(
+            platform=platform,
+            chat_id=str(chat_id),
+            chat_type=chat_type,
+            thread_id=str(thread_id) if thread_id else None,
+            user_id=(getattr(original_source, "user_id", None) or user_id or None),
+            user_name=(getattr(original_source, "user_name", None) or user_name or None),
+            chat_name=getattr(original_source, "chat_name", None),
+        )
+
+    @staticmethod
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
@@ -8061,6 +8125,9 @@ class GatewayRunner:
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
+
+        if canonical == "whereami":
+            return await self._handle_whereami_command(event)
         
         if canonical == "help":
             return await self._handle_help_command(event)
@@ -11818,6 +11885,14 @@ class GatewayRunner:
             )
 
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
+
+    async def _handle_whereami_command(self, event: MessageEvent) -> str:
+        """Handle /whereami -- show current routing/topic diagnostics."""
+        try:
+            from gateway.topic_registry import describe_current_topic
+            return describe_current_topic(event.source)
+        except Exception as exc:
+            return f"Could not inspect current topic: {exc}"
 
     @staticmethod
     def _get_guild_id(event: MessageEvent) -> Optional[int]:
@@ -15859,6 +15934,20 @@ class GatewayRunner:
                             session_id,
                         )
                         break
+                    route_platform, route_chat, route_thread = self._resolve_background_notification_target(
+                        platform_name=source.platform.value,
+                        chat_id=source.chat_id,
+                        thread_id=source.thread_id,
+                    )
+                    routed_source = self._build_background_notification_source(
+                        original_source=source,
+                        platform_name=route_platform,
+                        chat_id=route_chat,
+                        thread_id=route_thread,
+                        user_id=user_id,
+                        user_name=user_name,
+                    )
+                    source = routed_source or source
 
                     adapter = None
                     for p, a in self.adapters.items():
@@ -15893,6 +15982,11 @@ class GatewayRunner:
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
+                    route_platform, route_chat, route_thread = self._resolve_background_notification_target(
+                        platform_name=platform_name,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                    )
                     new_output = session.output_buffer[-1000:] if session.output_buffer else ""
                     message_text = (
                         f"[Background process {session_id} finished with exit code {session.exit_code}~ "
@@ -15900,13 +15994,13 @@ class GatewayRunner:
                     )
                     adapter = None
                     for p, a in self.adapters.items():
-                        if p.value == platform_name:
+                        if p.value == route_platform:
                             adapter = a
                             break
-                    if adapter and chat_id:
+                    if adapter and route_chat:
                         try:
-                            send_meta = {"thread_id": thread_id} if thread_id else None
-                            await adapter.send(chat_id, message_text, metadata=send_meta)
+                            send_meta = {"thread_id": route_thread} if route_thread else None
+                            await adapter.send(route_chat, message_text, metadata=send_meta)
                         except Exception as e:
                             logger.error("Watcher delivery error: %s", e)
                 break
@@ -15926,8 +16020,19 @@ class GatewayRunner:
                         break
                 if adapter and chat_id:
                     try:
-                        send_meta = {"thread_id": thread_id} if thread_id else None
-                        await adapter.send(chat_id, message_text, metadata=send_meta)
+                        route_platform, route_chat, route_thread = self._resolve_background_notification_target(
+                            platform_name=platform_name,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                        )
+                        if route_platform != platform_name:
+                            adapter = None
+                            for p, a in self.adapters.items():
+                                if p.value == route_platform:
+                                    adapter = a
+                                    break
+                        send_meta = {"thread_id": route_thread} if route_thread else None
+                        await adapter.send(route_chat, message_text, metadata=send_meta)
                     except Exception as e:
                         logger.error("Watcher delivery error: %s", e)
 
