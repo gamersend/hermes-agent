@@ -35,6 +35,21 @@ function electronBuilderCli() {
   return path.join(path.dirname(pkgJson), rel)
 }
 
+function isDirBuild(argv) {
+  return argv.includes("--dir")
+}
+
+function hasExplicitSigningEnv(env) {
+  return Boolean(
+    env.CSC_NAME ||
+      env.CSC_LINK ||
+      env.CSC_KEY_PASSWORD ||
+      env.CSC_IDENTITY_AUTO_DISCOVERY ||
+      env.APPLE_API_KEY ||
+      env.APPLE_NOTARY_PROFILE
+  )
+}
+
 const dist = electronDistDir()
 const args = []
 if (dist && fs.existsSync(distBinary(dist))) {
@@ -47,8 +62,21 @@ if (dist && fs.existsSync(distBinary(dist))) {
 }
 args.push(...process.argv.slice(2))
 
+const env = { ...process.env }
+if (process.platform === "darwin" && isDirBuild(args) && !hasExplicitSigningEnv(env)) {
+  // `npm run pack` / `--dir` is the local desktop build used by `hermes desktop`.
+  // It does not need distribution signing. If the login keychain contains a
+  // usable-looking Developer ID cert but codesign cannot access the private key
+  // from a non-interactive shell, electron-builder auto-discovery turns a local
+  // build into an avoidable errSecInternalComponent failure. Leave dist/DMG/ZIP
+  // builds alone, and let explicit CSC_* / APPLE_* env vars opt back into signing.
+  env.CSC_IDENTITY_AUTO_DISCOVERY = "false"
+  console.warn("[run-electron-builder] disabled macOS signing auto-discovery for --dir build")
+}
+
 const result = spawnSync(process.execPath, [electronBuilderCli(), ...args], {
   stdio: "inherit",
+  env,
 })
 if (result.error) {
   console.error(`[run-electron-builder] spawn failed: ${result.error.message}`)
