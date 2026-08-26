@@ -8,7 +8,7 @@
 
 repo: hermes-agent
 ecosystem: gamersend
-status: active  # dev:inferred
+status: active
 
 targets:
   - id: dagger
