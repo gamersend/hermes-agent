@@ -43,11 +43,12 @@ The backend POSTs to:
 
 Request headers include:
 
+- Define one named wire constant: `CODEX_CLIENT_VERSION = "0.153.0"`, copied from current OMP. Both versioned headers must derive from this constant; Hermes version `0.17.0` is not the wire client version.
 - `Authorization: Bearer <Hermes-owned OAuth access token>`
 - `OpenAI-Alpha: quicksilver=v2`
-- `User-Agent: Codex Desktop/<current Hermes-compatible client version>`
+- `User-Agent: Codex Desktop/<CODEX_CLIENT_VERSION>`
 - OMP originator header with `Codex Desktop`
-- OMP version header
+- `version: <CODEX_CLIENT_VERSION>`
 - `x-session-id: <generated realtime session ID>`
 - scoped session ID header
 - thread ID header
@@ -147,8 +148,8 @@ Focused tests defend observable contracts:
 
 1. Live credential resolver reads Hermes auth only and never opens `~/.codex/auth.json`.
 2. Near-expiry access token refresh persists a rotated refresh token.
-3. Device-code/token HTTP requests include the Hermes client User-Agent.
-4. Signaling request contains exact endpoint, headers, account ID extraction, body, and delegation.
+3. Device-code/token HTTP requests include the Hermes client User-Agent explicitly.
+4. Signaling request contains exact endpoint, headers, account ID extraction, body, and delegation; `User-Agent` and `version` both derive from the pinned `CODEX_CLIENT_VERSION = "0.153.0"` value.
 5. Raw SDP and `{sdp}` answers parse; malformed/missing `rtc_*` Location fails closed.
 6. Sideband retries are bounded and use the full authenticated header set.
 7. Sideband events are forwarded once; data-channel transcript/delegation events are ignored after sideband opens; data-channel errors still surface.
