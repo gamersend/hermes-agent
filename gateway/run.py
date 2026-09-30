@@ -4633,7 +4633,7 @@ def _housekeeping_media_caches() -> None:
         cleanup_audio_cache, cleanup_document_cache, cleanup_image_cache, cleanup_screenshot_cache,
         cleanup_video_cache)
     from tools.tool_result_storage import cleanup_spillover_cache
-    from tools.environments.local import cleanup_terminal_temp_cache
+    from tools.environments.local import cleanup_orphan_snapshots, cleanup_terminal_temp_cache
     from tools.bot_mode_dm import cleanup_bot_dm_cache
     from tools.bot_relay import cleanup_bot_relay_artifacts
 
@@ -4642,6 +4642,7 @@ def _housekeeping_media_caches() -> None:
         ("Audio", cleanup_audio_cache), ("Video", cleanup_video_cache),
         ("Screenshot", cleanup_screenshot_cache), ("Spillover", cleanup_spillover_cache),
         ("Terminal temp", cleanup_terminal_temp_cache), ("Bot DM", cleanup_bot_dm_cache),
+        ("Session snapshot", cleanup_orphan_snapshots),
         ("Bot relay", cleanup_bot_relay_artifacts)):
         def _one(name=cache_name, fn=cleanup_fn):
             removed = fn(max_age_hours=24)

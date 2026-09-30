@@ -28,6 +28,7 @@ from tools.environments.local_env_policy import (  # noqa: F401 — _HERMES_PROV
     strip_profile_gate_env)
 from tools.environments.local_pythonpath import (
     _build_hermes_repo_root_aliases, _strip_hermes_owned_pythonpath_and_runtime_markers)
+from tools.environments.snapshot_acl import snapshot_harden_shell_command
 
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -99,17 +100,136 @@ def cleanup_terminal_temp_cache(max_age_hours: float = TERMINAL_TEMP_MAX_IDLE_HO
     return removed
 
 
+# --- Orphaned session-snapshot sweep ---
+# The snapshot *is* the user's login environment, unredacted by design (see
+# tools/environments/snapshot_acl), which makes an orphaned one a live credential file.
+# cleanup() unlinks it on graceful teardown only, and cleanup_terminal_temp_cache() watches
+# just the managed HERMES_HOME cache dir — so a session whose Hermes process is killed,
+# crashes, or loses its terminal leaves the snapshot wherever its temp dir happened to be
+# (TMPDIR roots included, which is exactly where the widest ACLs live) with nothing to reap
+# it. Every snapshot name carries the pid that created it (hermes-snap-<pid>-<session>.sh),
+# so an orphan is identifiable instead of guessed: its owner is gone.
+SNAPSHOT_MAX_IDLE_HOURS = 4.0
+# Never touch a snapshot this fresh: a session that is still booting must not lose its file
+# to a sweep running in the same or a parallel process.
+_SNAPSHOT_SWEEP_MIN_AGE_SECONDS = 60
+_SNAPSHOT_FILE_RE = re.compile(
+    r"^hermes-snap-(?:(?P<pid>\d+)-)?[0-9a-f]{12}\.sh(?P<tmp>\.tmp\.\w+)?$")
+
+
+def _snapshot_sweep_roots() -> list[Path]:
+    """Every directory this host may hold Hermes session snapshots in: the managed
+    HERMES_HOME cache dir, the configured/process temp dirs, and the system temp root."""
+    roots: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(candidate) -> None:
+        if not candidate:
+            return
+        try:
+            path = Path(candidate)
+            if not path.is_dir():
+                return
+            key = os.path.normcase(str(path))
+        except (OSError, TypeError, ValueError):
+            return
+        if key not in seen:
+            seen.add(key)
+            roots.append(path)
+
+    _add(_default_terminal_temp_dir())
+    for var in ("TERMINAL_TEMP_DIR", "TMPDIR", "TMP", "TEMP"):
+        _add(os.environ.get(var))
+    _add(tempfile.gettempdir())
+    return roots
+
+
+def _pid_alive(pid: int) -> bool:
+    """True when *pid* is a live process. Unknown errors count as alive so a sweep never
+    deletes a snapshot it cannot prove is orphaned."""
+    if pid <= 0:
+        return False
+    try:
+        import psutil
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        pass
+    try:
+        os.kill(pid, 0)  # signal 0 is existence-only; never terminates anything
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    except Exception:
+        return True
+    return True
+
+
+def cleanup_orphan_snapshots(max_age_hours: float = SNAPSHOT_MAX_IDLE_HOURS) -> int:
+    """Delete session snapshots whose owning session is gone; return the count removed.
+
+    A snapshot is an orphan when the pid in its name is no longer running (the process that
+    would have called cleanup() for it is dead). Names from older Hermes versions carry no
+    pid, so those fall back to being idle for *max_age_hours* — the caller's value is capped
+    at ``SNAPSHOT_MAX_IDLE_HOURS`` because the gateway housekeeping loop passes 24h, far too
+    long for a file holding live credentials. Files younger than
+    ``_SNAPSHOT_SWEEP_MIN_AGE_SECONDS`` are always kept.
+    """
+    try:
+        cutoff_hours = min(float(max_age_hours), SNAPSHOT_MAX_IDLE_HOURS)
+    except (TypeError, ValueError):
+        cutoff_hours = SNAPSHOT_MAX_IDLE_HOURS
+    now = time.time()
+    cutoff = now - cutoff_hours * 3600
+    grace = now - _SNAPSHOT_SWEEP_MIN_AGE_SECONDS
+
+    removed = 0
+    for root in _snapshot_sweep_roots():
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            match = _SNAPSHOT_FILE_RE.match(entry.name)
+            if not match:
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= grace:
+                continue
+            owner_pid = int(match.group("pid")) if match.group("pid") else None
+            if owner_pid is not None:
+                if _pid_alive(owner_pid):
+                    continue  # a live session, possibly in another Hermes process
+            elif mtime >= cutoff:
+                continue  # legacy name: judge on idleness alone
+            try:
+                entry.unlink()
+                removed += 1
+            except OSError:
+                continue
+    return removed
+
+
 def _prune_terminal_temp_once() -> None:
-    """Best-effort prune, at most once per process (CLI-only installs)."""
+    """Best-effort prune, at most once per process (CLI-only installs). Sweeps orphaned
+    session snapshots too: their owner is gone by definition at startup, and they are the
+    one artifact here that carries the full unredacted environment."""
     global _terminal_temp_pruned_once
     with _terminal_temp_prune_lock:
         if _terminal_temp_pruned_once:
             return
         _terminal_temp_pruned_once = True
-    try:
-        cleanup_terminal_temp_cache()
-    except Exception as exc:
-        logger.debug("Terminal temp prune failed: %s", exc)
+    for label, sweep in (("terminal temp", cleanup_terminal_temp_cache),
+                         ("orphaned session snapshot", cleanup_orphan_snapshots)):
+        try:
+            removed = sweep()
+            if removed:
+                logger.info("Startup sweep removed %d stale %s file(s)", removed, label)
+        except Exception as exc:
+            logger.debug("%s sweep failed: %s", label, exc)
 
 
 # --- Windows / MSYS path translation ---
@@ -968,6 +1088,16 @@ class LocalEnvironment(BaseEnvironment):
     def _quote_shell_path(self, path: str) -> str:
         """Rewrite native/mixed Windows paths before quoting for Git Bash."""
         return _quote_bash_path(path)
+
+    def _snapshot_harden_shell(self) -> str:
+        """Windows only: the snapshot inherits whatever the temp dir grants, and the temp
+        dir is exactly where a sandbox group holds an explicit ACE — so the file gets its
+        own inheritance-disabled, owner-only DACL at creation
+        (see ``tools.environments.snapshot_acl``). POSIX needs nothing here: ``umask 077``
+        before ``mktemp`` already yields 0600, and a rename preserves it."""
+        if not _IS_WINDOWS:
+            return ""
+        return snapshot_harden_shell_command()
 
     def _recover_cwd(self) -> None:
         """Swap ``self.cwd`` for a usable directory if it vanished or is inaccessible

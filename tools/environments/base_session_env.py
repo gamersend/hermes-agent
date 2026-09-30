@@ -88,6 +88,7 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
 
 def _snapshot_bootstrap_script(
     *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str, excluded_names: Iterable[str], cwd_marker: str,
+    harden_cmd: str = "",
 ) -> str:
     """Login-shell bootstrap that captures env/functions/aliases into the snapshot. Atomic publish:
     assemble in a ``mktemp`` file, then ``mv`` over the final path so a concurrent ``source`` never
@@ -96,11 +97,16 @@ def _snapshot_bootstrap_script(
     ``declare -F`` (a line-based ``declare -f | grep -v`` strips the header and leaves an orphaned
     body that breaks every sourced command); the non-empty guard matters because bare ``declare -f``
     dumps ALL functions. The trailing ``cd`` restores the configured cwd after profile scripts (e.g.
-    ``cd ~``) so ``pwd -P`` reports terminal.cwd, not the profile's directory."""
+    ``cd ~``) so ``pwd -P`` reports terminal.cwd, not the profile's directory.
+
+    ``harden_cmd`` (see ``tools.environments.snapshot_acl``) runs on the temp file *before* the
+    first byte of environment is written, so the snapshot is never on disk with credentials
+    under an inherited directory grant. It must not fail the bootstrap; the snippet self-guards."""
     return (
         "umask 077\n"
         f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) || exit 1\n"
-        f"{_export_dump_excluding_session_vars(_SNAP_TMP, excluded_names)}\n"
+        + (f"{harden_cmd}\n" if harden_cmd else "")
+        + f"{_export_dump_excluding_session_vars(_SNAP_TMP, excluded_names)}\n"
         "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
         f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> {_SNAP_TMP} 2>/dev/null || true\n"
         f"alias -p >> {_SNAP_TMP}\n"
@@ -131,7 +137,8 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
 
 def _wrap_command_script(
     command: str, *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str,
-    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str) -> str:
+    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
+    harden_cmd: str = "") -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``source`` stdout goes to /dev/null because macOS bash 3.2 / some Homebrew builds echo
     ``declare -x`` lines when sourcing. AI_AGENT/HERMES_AGENT advertise the harness to remote
@@ -140,7 +147,10 @@ def _wrap_command_script(
     uses the same mktemp+mv atomic publish as the bootstrap and chains ``mv`` on the dump
     succeeding so a failed dump never replaces a good snapshot. ``umask 077`` is applied after
     the user's command so snapshot files (which may carry secrets) are private without
-    changing the command's umask.
+    changing the command's umask. ``harden_cmd`` (see ``tools.environments.snapshot_acl``)
+    re-applies the owner-only permission to the freshly created temp file before it is
+    written — the re-dump replaces the published snapshot on every command, so the grant has
+    to be re-asserted here too.
     """
     escaped = command.replace("'", "'\\''")
     save, restore = _passthrough_save_restore(passthrough_names)
@@ -159,7 +169,8 @@ def _wrap_command_script(
     if snapshot_ready:
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
-            f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "
+            + (f"{harden_cmd} && " if harden_cmd else "")
+            + f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "
             f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
     parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]

@@ -29,6 +29,7 @@ from tools.environments.base_session_env import (
     _wrap_command_script,
 )
 from tools.environments.base_wait import _WaitTrace
+from tools.environments.snapshot_acl import harden_snapshot_file
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -264,7 +265,11 @@ class BaseEnvironment(ABC):
 
         self._session_id = uuid.uuid4().hex[:12]
         temp_dir = self.get_temp_dir().rstrip("/") or "/"
-        self._snapshot_path = f"{temp_dir}/hermes-snap-{self._session_id}.sh"
+        # The creator's pid is part of the name so an orphaned snapshot — the file a session
+        # leaves behind when its Hermes process dies without running cleanup() — can be told
+        # apart from a live one without guessing: see
+        # tools/environments/local.cleanup_orphan_snapshots().
+        self._snapshot_path = f"{temp_dir}/hermes-snap-{os.getpid()}-{self._session_id}.sh"
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._snapshot_ready = False
@@ -345,6 +350,14 @@ class BaseEnvironment(ABC):
             logger.debug("Could not refresh profile-scoped snapshot exclusions", exc_info=True)
         return tuple(sorted(self._snapshot_passthrough_names))
 
+    def _snapshot_harden_shell(self) -> str:
+        """Shell snippet that pins the snapshot temp file to its owner, run right after
+        ``mktemp`` (see ``tools.environments.snapshot_acl``). Empty where the file mode
+        already does the job — POSIX ``umask 077`` — and only meaningful when commands run
+        on the Hermes host itself, so ``LocalEnvironment`` supplies it: on a remote backend
+        the snapshot lives in the sandbox and its own isolation governs."""
+        return ""
+
     def _snapshot_script_kwargs(self, cwd: str) -> dict:
         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.
         ``_quote_cwd_for_cd`` / ``_quote_shell_path`` (not bare shlex.quote) let the Windows
@@ -353,6 +366,7 @@ class BaseEnvironment(ABC):
             quoted_cwd=self._quote_cwd_for_cd(cwd),
             quoted_snap=self._quote_shell_path(self._snapshot_path),
             snap_tmp_template=self._quote_shell_path(self._snapshot_path + _SNAP_TMP_SUFFIX),
+            harden_cmd=self._snapshot_harden_shell(),
             cwd_marker=self._cwd_marker)
 
     def init_session(self):
@@ -368,6 +382,11 @@ class BaseEnvironment(ABC):
             if int(result.get("returncode") or 0) != 0:
                 raise RuntimeError(f"snapshot bootstrap failed with exit code {result.get('returncode')}")
             self._snapshot_ready = True
+            if self.is_local and not harden_snapshot_file(self._snapshot_path):
+                logger.warning(
+                    "Could not restrict the session snapshot to its owner: %s "
+                    "(it holds the unredacted environment; check the temp dir ACL)",
+                    self._snapshot_path)
             self._update_cwd(result)
             logger.info("Session snapshot created (session=%s, cwd=%s)", self._session_id, self.cwd)
         except Exception as exc:
