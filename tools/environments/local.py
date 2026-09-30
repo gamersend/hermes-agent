@@ -117,9 +117,40 @@ _SNAPSHOT_FILE_RE = re.compile(
     r"^hermes-snap-(?:(?P<pid>\d+)-)?[0-9a-f]{12}\.sh(?P<tmp>\.tmp\.\w+)?$")
 
 
+def _platform_temp_roots() -> list[Path]:
+    """The host's real temp roots, independent of the per-run rewriting Hermes does.
+
+    Every process-visible temp variable is not enough on its own: Hermes points
+    ``TMPDIR``/``TMP``/``TEMP`` at a per-run directory, so on the host where this defect was
+    found the swept roots were the run scratch dir and ``HERMES_HOME/cache/terminal`` while
+    the snapshots that actually leaked sat in the Windows temp root — invisible to the sweep
+    that exists to reap them.
+    """
+    roots: list[Path] = []
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            roots.append(Path(local_app_data) / "Temp")
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            roots.append(Path(user_profile) / "AppData" / "Local" / "Temp")
+        system_root = os.environ.get("SystemRoot")
+        if system_root:
+            roots.append(Path(system_root) / "Temp")
+    else:
+        roots.extend((Path("/tmp"), Path("/var/tmp")))
+    return roots
+
+
 def _snapshot_sweep_roots() -> list[Path]:
     """Every directory this host may hold Hermes session snapshots in: the managed
-    HERMES_HOME cache dir, the configured/process temp dirs, and the system temp root."""
+    HERMES_HOME cache dir, the configured/process temp dirs (with their parents, since a
+    rewritten TMPDIR can be one level below the real temp root), and the platform temp roots.
+
+    Deliberately not recursive. The snapshots that leaked sit directly in a temp root or in
+    the managed cache dir, and a per-run scratch subdirectory is owned and removed by the
+    process that made it.
+    """
     roots: list[Path] = []
     seen: set[str] = set()
 
@@ -138,9 +169,18 @@ def _snapshot_sweep_roots() -> list[Path]:
             roots.append(path)
 
     _add(_default_terminal_temp_dir())
-    for var in ("TERMINAL_TEMP_DIR", "TMPDIR", "TMP", "TEMP"):
-        _add(os.environ.get(var))
-    _add(tempfile.gettempdir())
+    temp_candidates = [os.environ.get(var) for var in ("TERMINAL_TEMP_DIR", "TMPDIR", "TMP", "TEMP")]
+    temp_candidates.append(tempfile.gettempdir())
+    for candidate in temp_candidates:
+        _add(candidate)
+        # A rewritten temp dir lives *inside* the real one; its parent is the root that has
+        # to be watched as well.
+        try:
+            _add(Path(candidate).parent if candidate else None)
+        except (OSError, TypeError, ValueError):
+            pass
+    for root in _platform_temp_roots():
+        _add(root)
     return roots
 
 

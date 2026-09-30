@@ -163,5 +163,43 @@ def test_sweep_roots_include_the_process_temp_dir(monkeypatch, tmp_path):
     assert str(tmp_path / "terminal").lower() in roots
 
 
+def test_rewritten_temp_dir_still_watches_the_real_temp_root(monkeypatch, tmp_path):
+    """Hermes points TMPDIR/TMP/TEMP at a per-run directory, so an env-only root list never
+    looked at the temp root the snapshots actually leaked into."""
+    import tempfile
+
+    real_temp = tmp_path / "RealTemp"
+    run_scratch = real_temp / "paperclip-run-x"
+    run_scratch.mkdir(parents=True)
+    for var in ("TMPDIR", "TMP", "TEMP"):
+        monkeypatch.setenv(var, str(run_scratch))
+    monkeypatch.delenv("TERMINAL_TEMP_DIR", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(run_scratch))
+    monkeypatch.setattr(local_mod, "_platform_temp_roots", lambda: [])
+
+    roots = [str(path) for path in local_mod._snapshot_sweep_roots()]
+    assert str(run_scratch) in roots
+    assert str(real_temp) in roots, "the parent of a rewritten temp dir must be swept too"
+
+
+def test_platform_temp_roots_are_watched_whatever_the_env_says(monkeypatch, tmp_path):
+    """The host's own temp root is a sweep root regardless of the process environment."""
+    platform_temp = tmp_path / "PlatformTemp"
+    platform_temp.mkdir()
+    monkeypatch.setattr(local_mod, "_platform_temp_roots", lambda: [platform_temp])
+
+    roots = [str(path) for path in local_mod._snapshot_sweep_roots()]
+    assert str(platform_temp) in roots
+
+
+def test_platform_temp_roots_resolve_from_the_windows_environment(monkeypatch):
+    monkeypatch.setattr(local_mod.os, "name", "nt")
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\example\AppData\Local")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    assert [str(path) for path in local_mod._platform_temp_roots()] == [
+        r"C:\Users\example\AppData\Local\Temp", r"C:\Windows\Temp"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
