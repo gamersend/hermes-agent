@@ -120,6 +120,40 @@ def test_used_pid_detection_helper_is_honest():
     assert local_mod._pid_alive(0) is False
 
 
+def test_liveness_fallback_without_psutil_is_honest():
+    """``psutil`` is optional — the packaged runtime interpreter does not ship it — so the
+    fallback is the path that actually runs in production. On Windows it must not be built on
+    ``os.kill(pid, 0)``: that returns normally for a pid that is gone, which would make every
+    orphan read as alive and turn the sweep into a silent no-op."""
+    assert local_mod._pid_alive_without_psutil(os.getpid()) is True
+    assert local_mod._pid_alive_without_psutil(_dead_pid()) is False
+    assert local_mod._pid_alive_without_psutil(0) is False
+
+
+def test_sweep_reaps_a_real_orphan_when_psutil_is_absent(sweep_dir, monkeypatch):
+    monkeypatch.setattr(local_mod, "_pid_alive", local_mod._pid_alive_without_psutil)
+    orphan = sweep_dir / f"hermes-snap-{_dead_pid()}-abcdef123456.sh"
+    orphan.write_text("export SECRET=1\n")
+    _age(orphan, 120)
+    assert local_mod.cleanup_orphan_snapshots() == 1
+    assert not orphan.exists()
+
+
+@pytest.mark.platforms("windows")
+def test_windows_liveness_never_terminates_the_probe_target():
+    """``os.kill`` on Windows is ``TerminateProcess`` for any signal it does not special-case,
+    so an existence probe must never be built on it. Prove the kernel query runs and that the
+    probed process is still alive afterwards."""
+    probe = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        assert local_mod._pid_alive_windows(probe.pid) is True
+        assert probe.poll() is None, "the liveness probe killed the process it was asking about"
+    finally:
+        probe.kill()
+        probe.wait()
+    assert local_mod._pid_alive_windows(probe.pid) is False
+
+
 def test_sweep_roots_include_the_process_temp_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("TERMINAL_TEMP_DIR", str(tmp_path / "terminal"))

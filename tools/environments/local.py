@@ -153,9 +153,25 @@ def _pid_alive(pid: int) -> bool:
         import psutil
         return bool(psutil.pid_exists(pid))
     except Exception:
-        pass
+        pass  # psutil is optional: the packaged runtime interpreter does not ship it
+    return _pid_alive_without_psutil(pid)
+
+
+def _pid_alive_without_psutil(pid: int) -> bool:
+    """Liveness without the optional ``psutil`` dependency.
+
+    Windows must NOT probe with ``os.kill(pid, 0)``: it does not raise for a pid that is
+    gone, so every orphan would read as alive and the sweep would silently reap nothing —
+    the exact host this exists for. Ask the kernel instead (``OpenProcess`` +
+    ``GetExitCodeProcess``), and treat "cannot tell" as alive so nothing live is deleted.
+    POSIX keeps ``kill(pid, 0)``, where signal 0 is a documented existence probe.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
     try:
-        os.kill(pid, 0)  # signal 0 is existence-only; never terminates anything
+        os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except OSError:
@@ -163,6 +179,29 @@ def _pid_alive(pid: int) -> bool:
     except Exception:
         return True
     return True
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    """``OpenProcess``-based existence check; never terminates the target."""
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_INVALID_PARAMETER = 87
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # ERROR_INVALID_PARAMETER is how this API reports "no such process"; anything else
+        # (access denied on a protected process, say) means the pid may well be alive.
+        return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True  # unknown: keep the file
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def cleanup_orphan_snapshots(max_age_hours: float = SNAPSHOT_MAX_IDLE_HOURS) -> int:
