@@ -5,6 +5,8 @@ while the install lock is held. The stdlib boot journal owns crash recovery.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import base64
 import hashlib
 import io
@@ -13,11 +15,41 @@ import threading
 from pathlib import Path
 
 from pm.environments import dependency_home_root, install_state_dir, runtime_facts_path
-from pm.filesystem import durable_write_bytes, file_digest, read_bytes_or_none
+from pm.filesystem import durable_write_bytes, file_digest, lock_fd, read_bytes_or_none
 from pm.workspace import enabled_plugin_dirs, _is_member_candidate
 
 
 _METADATA_LOCK_HOLDER = threading.local()
+
+
+@contextmanager
+def _metadata_lock(path: Path):
+    """Share the application's metadata byte lock without importing its auth graph."""
+    import os
+
+    holder = _METADATA_LOCK_HOLDER
+    if getattr(holder, "depth", 0):
+        holder.depth += 1
+        try:
+            yield
+        finally:
+            holder.depth -= 1
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        if os.name == "nt" and stream.tell() == 0:
+            try:
+                stream.write(b" ")
+                stream.flush()
+            except PermissionError:
+                pass  # Another holder already owns the byte we need to lock.
+        if not lock_fd(stream.fileno(), wait=True, timeout=10.0):
+            raise TimeoutError("Timed out waiting for the plugin install metadata lock")
+        holder.depth = 1
+        try:
+            yield
+        finally:
+            holder.depth = 0  # Closing the stream releases the kernel lock on both platforms.
 
 
 def _metadata_records(data: bytes | None) -> dict:
@@ -142,7 +174,6 @@ class StagedPlugin:
     def publish(self, project: Path) -> None:
         import os
         import uuid
-        from hermes_cli.auth import _file_lock
         from pm.store import tree_digest
 
         if selection_snapshot() != self.configs:
@@ -150,8 +181,7 @@ class StagedPlugin:
         if tree_digest(self.staged) != self.staged_digest:
             raise ValueError("Staged plugin files changed while preparing the update; retry.")
         lock = self.metadata.with_name(f"{self.metadata.name}.lock")
-        with _file_lock(lock, _METADATA_LOCK_HOLDER, 10.0,
-                        "Timed out waiting for the plugin install metadata lock"):
+        with _metadata_lock(lock):
             previous = read_bytes_or_none(self.metadata)
             metadata = _metadata_records(previous)
             if metadata.get(self.target.name) != self.old_record:
