@@ -98,7 +98,7 @@ Hermes reads environment variables from the process environment and, for user-ma
 | `OPENCODE_ZEN_BASE_URL` | Override OpenCode Zen base URL |
 | `OPENCODE_GO_API_KEY` | OpenCode Go API key — $10/month subscription for open models ([opencode.ai](https://opencode.ai/auth)) |
 | `OPENCODE_GO_BASE_URL` | Override OpenCode Go base URL |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Explicit Claude Code token override if you export one manually |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Explicit per-host setup-token override; never an imported interactive login |
 | `HERMES_MODEL` | Override model name at process level (used by cron scheduler; prefer `config.yaml` for normal use) |
 | `VOICE_TOOLS_OPENAI_KEY` | Preferred OpenAI key for OpenAI speech-to-text and text-to-speech providers |
 | `HERMES_LOCAL_STT_COMMAND` | Optional local speech-to-text command template. Supports `{input_path}`, `{output_dir}`, `{language}`, and `{model}` placeholders |
@@ -114,7 +114,7 @@ Hermes reads environment variables from the process environment and, for user-ma
 
 ## Provider Auth (OAuth)
 
-For native Anthropic auth, Hermes prefers Claude Code's own credential files when they exist because those credentials can refresh automatically. **OAuth against Anthropic requires a Claude Max plan with purchased extra usage credits** — Hermes routes as Claude Code, which only draws from the Max plan's extra/overage credits, not the base Max allowance, and does not work on Claude Pro. Without Max + extra credits, use an API key instead. Environment variables such as `ANTHROPIC_TOKEN` remain useful as manual overrides, but they are no longer the preferred path for Claude Max login.
+Native Anthropic uses Hermes' own PKCE login or explicitly provisioned host-only setup tokens/API keys. Hermes does not read, refresh or write Claude Code's interactive credential store. `ANTHROPIC_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are explicit overrides, so use a separate setup token for the calling host and never copy an interactive login. Provider plan eligibility and billing must be checked with Anthropic for the chosen authentication method.
 
 | Variable | Description |
 |----------|-------------|

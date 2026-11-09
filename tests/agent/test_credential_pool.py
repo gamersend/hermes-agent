@@ -1444,7 +1444,7 @@ def test_load_pool_removes_nous_device_code_when_singleton_quarantined(tmp_path,
     assert [entry["id"] for entry in auth_payload["credential_pool"]["nous"]] == ["manual-key"]
 
 
-def test_load_pool_removes_stale_file_backed_singleton_entry(tmp_path, monkeypatch):
+def test_load_pool_retains_borrowed_metadata_but_cannot_select_it(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
@@ -1483,10 +1483,11 @@ def test_load_pool_removes_stale_file_backed_singleton_entry(tmp_path, monkeypat
 
     pool = load_pool("anthropic")
 
-    assert pool.entries() == []
+    assert [entry.id for entry in pool.entries()] == ["seeded-file"]
+    assert pool.select() is None
 
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
-    assert auth_payload["credential_pool"]["anthropic"] == []
+    assert auth_payload["credential_pool"]["anthropic"][0]["id"] == "seeded-file"
 
 
 def test_load_pool_migrates_nous_provider_state_preserves_tls(tmp_path, monkeypatch):
@@ -1720,14 +1721,8 @@ def test_load_pool_api_key_path_prunes_stale_oauth_entries(tmp_path, monkeypatch
     assert "env:ANTHROPIC_API_KEY" in sources
 
 
-def test_load_pool_oauth_path_still_autodiscovers(tmp_path, monkeypatch):
-    """OAuth path: ANTHROPIC_TOKEN set, autodiscovery still fires.
-
-    Regression guard: the API-key gate must not affect users who chose the
-    OAuth path at `hermes setup`.  When ANTHROPIC_TOKEN is set (and
-    ANTHROPIC_API_KEY is empty), autodiscovered Claude Code creds should
-    still be seeded into the pool as before.
-    """
+def test_load_pool_oauth_path_does_not_autodiscover_claude(tmp_path, monkeypatch):
+    """Choosing Hermes OAuth never authorizes importing Claude Code's login."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-explicit-oauth-token")
@@ -1753,9 +1748,9 @@ def test_load_pool_oauth_path_still_autodiscovers(tmp_path, monkeypatch):
     pool = load_pool("anthropic")
     sources = {entry.source for entry in pool.entries()}
 
-    # Both env OAuth token and autodiscovered Claude Code creds should be there.
+    # Only the explicit host token is eligible; the external reader is ignored.
     assert "env:ANTHROPIC_TOKEN" in sources
-    assert "claude_code" in sources
+    assert "claude_code" not in sources
 
 
 def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):

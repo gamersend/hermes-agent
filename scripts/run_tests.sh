@@ -33,20 +33,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Activate venv ───────────────────────────────────────────────────────────
-VENV=""
+PYTHON=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    VENV="$candidate"
+  if [ -f "$candidate/bin/activate" ] && [ -f "$candidate/bin/python" ]; then
+    PYTHON="$candidate/bin/python"
+    break
+  elif [ -f "$candidate/Scripts/activate" ] && [ -f "$candidate/Scripts/python.exe" ]; then
+    # Native Windows virtualenvs use Scripts; Git Bash can invoke python.exe.
+    PYTHON="$candidate/Scripts/python.exe"
     break
   fi
 done
 
-if [ -z "$VENV" ]; then
+if [ -z "$PYTHON" ]; then
   echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
   exit 1
 fi
-
-PYTHON="$VENV/bin/python"
 
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
@@ -58,6 +60,17 @@ if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
 fi
 
 
+# Windows Python resolves the user home from USERPROFILE, not HOME. Keep only
+# the OS path variables needed to start the interpreter; never provider secrets.
+WINDOWS_TEST_ENV=()
+case "${OSTYPE:-}" in
+  msys*|mingw*|cygwin*)
+    for name in USERPROFILE SYSTEMROOT LOCALAPPDATA APPDATA TEMP TMP; do
+      if [ -n "${!name:-}" ]; then WINDOWS_TEST_ENV+=("$name=${!name}"); fi
+    done
+    ;;
+esac
+
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
@@ -67,6 +80,8 @@ echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 cd "$REPO_ROOT"
 
 exec env -i \
+  "${WINDOWS_TEST_ENV[@]}" \
+  PYTHONUTF8=1 \
   PATH="$PATH" \
   HOME="$HOME" \
   TZ=UTC \

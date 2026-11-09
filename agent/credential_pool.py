@@ -458,7 +458,10 @@ class CredentialPool:
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
 
     def has_credentials(self) -> bool:
-        return bool(self._entries)
+        return any(
+            not (self.provider == "anthropic" and entry.source == "claude_code")
+            for entry in self._entries
+        )
 
     def has_available(self) -> bool:
         """True if at least one entry is not currently in exhaustion cooldown."""
@@ -470,7 +473,11 @@ class CredentialPool:
     def current(self) -> Optional[PooledCredential]:
         if not self._current_id:
             return None
-        return next((entry for entry in self._entries if entry.id == self._current_id), None)
+        return next((
+            entry for entry in self._entries
+            if entry.id == self._current_id
+            and not (self.provider == "anthropic" and entry.source == "claude_code")
+        ), None)
 
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
         """Swap an entry in-place by id, preserving sort order."""
@@ -538,43 +545,6 @@ class CredentialPool:
         self._replace_entry(entry, updated)
         self._persist()
         return updated
-
-    def _sync_anthropic_entry_from_credentials_file(self, entry: PooledCredential) -> PooledCredential:
-        """Sync a claude_code pool entry from ~/.claude/.credentials.json if tokens differ.
-
-        OAuth refresh tokens are single-use. When something external (e.g.
-        Claude Code CLI, or another profile's pool) refreshes the token, it
-        writes the new pair to ~/.claude/.credentials.json. The pool entry's
-        refresh token becomes stale. This method detects that and syncs.
-        """
-        if self.provider != "anthropic" or entry.source != "claude_code":
-            return entry
-        try:
-            from agent.anthropic_adapter import read_claude_code_credentials
-            creds = read_claude_code_credentials()
-            if not creds:
-                return entry
-            file_refresh = creds.get("refreshToken", "")
-            file_access = creds.get("accessToken", "")
-            file_expires = creds.get("expiresAt", 0)
-            # If the credentials file has a different token pair, sync it
-            if file_refresh and file_refresh != entry.refresh_token:
-                logger.debug("Pool entry %s: syncing tokens from credentials file (refresh token changed)", entry.id)
-                updated = replace(
-                    entry,
-                    access_token=file_access,
-                    refresh_token=file_refresh,
-                    expires_at_ms=file_expires,
-                    last_status=None,
-                    last_status_at=None,
-                    last_error_code=None,
-                )
-                self._replace_entry(entry, updated)
-                self._persist()
-                return updated
-        except Exception as exc:
-            logger.debug("Failed to sync from credentials file: %s", exc)
-        return entry
 
     def _sync_codex_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync a Codex device_code pool entry from auth.json if tokens differ.
@@ -859,6 +829,10 @@ class CredentialPool:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        # Older pools may retain imported Claude Code records. Keep their
+        # metadata, but never consume another application's rotating login.
+        if self.provider == "anthropic" and entry.source == "claude_code":
+            return None
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -878,19 +852,6 @@ class CredentialPool:
                     refresh_token=refreshed["refresh_token"],
                     expires_at_ms=refreshed["expires_at_ms"],
                 )
-                # Keep ~/.claude/.credentials.json in sync so that the
-                # fallback path (resolve_anthropic_token) and other profiles
-                # see the latest tokens.
-                if entry.source == "claude_code":
-                    try:
-                        from agent.anthropic_adapter import _write_claude_code_credentials
-                        _write_claude_code_credentials(
-                            refreshed["access_token"],
-                            refreshed["refresh_token"],
-                            refreshed["expires_at_ms"],
-                        )
-                    except Exception as wexc:
-                        logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another Hermes
@@ -940,46 +901,6 @@ class CredentialPool:
                 return entry
         except Exception as exc:
             logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
-            # For anthropic claude_code entries: the refresh token may have been
-            # consumed by another process. Check if ~/.claude/.credentials.json
-            # has a newer token pair and retry once.
-            if self.provider == "anthropic" and entry.source == "claude_code":
-                synced = self._sync_anthropic_entry_from_credentials_file(entry)
-                if synced.refresh_token != entry.refresh_token:
-                    logger.debug("Retrying refresh with synced token from credentials file")
-                    try:
-                        from agent.anthropic_adapter import refresh_anthropic_oauth_pure
-                        refreshed = refresh_anthropic_oauth_pure(
-                            synced.refresh_token,
-                            use_json=synced.source.endswith("hermes_pkce"),
-                        )
-                        updated = replace(
-                            synced,
-                            access_token=refreshed["access_token"],
-                            refresh_token=refreshed["refresh_token"],
-                            expires_at_ms=refreshed["expires_at_ms"],
-                            last_status=STATUS_OK,
-                            last_status_at=None,
-                            last_error_code=None,
-                        )
-                        self._replace_entry(synced, updated)
-                        self._persist()
-                        try:
-                            from agent.anthropic_adapter import _write_claude_code_credentials
-                            _write_claude_code_credentials(
-                                refreshed["access_token"],
-                                refreshed["refresh_token"],
-                                refreshed["expires_at_ms"],
-                            )
-                        except Exception as wexc:
-                            logger.debug("Failed to write refreshed token to credentials file (retry path): %s", wexc)
-                        return updated
-                    except Exception as retry_exc:
-                        logger.debug("Retry refresh also failed: %s", retry_exc)
-                elif not self._entry_needs_refresh(synced):
-                    # Credentials file had a valid (non-expired) token — use it directly
-                    logger.debug("Credentials file has valid token, using without refresh")
-                    return synced
             # For xai-oauth: same race as nous — another process may have
             # consumed the refresh token between our proactive sync and the
             # HTTP call.  Re-check auth.json and adopt the fresh tokens if
@@ -1237,15 +1158,8 @@ class CredentialPool:
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
         for entry in self._entries:
-            # For anthropic claude_code entries, sync from the credentials file
-            # before any status/refresh checks. This picks up tokens refreshed
-            # by other processes (Claude Code CLI, other Hermes profiles).
-            if (self.provider == "anthropic" and entry.source == "claude_code"
-                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
-                synced = self._sync_anthropic_entry_from_credentials_file(entry)
-                if synced is not entry:
-                    entry = synced
-                    cleared_any = True
+            if self.provider == "anthropic" and entry.source == "claude_code":
+                continue
             # For nous entries, sync from auth.json before status checks.
             # Another process may have successfully refreshed via
             # resolve_nous_runtime_credentials(), making this entry's
@@ -1637,10 +1551,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             return False
 
     if provider == "anthropic":
-        # Only auto-discover external credentials (Claude Code, Hermes PKCE)
-        # when the user has explicitly configured anthropic as their provider.
-        # Without this gate, auxiliary client fallback chains silently read
-        # ~/.claude/.credentials.json without user consent.  See PR #4210.
+        # Auto-discover only Hermes-owned PKCE credentials, and only when
+        # Anthropic is explicitly configured. Claude Code's login stays separate.
         try:
             from hermes_cli.auth import is_provider_explicitly_configured
             if not is_provider_explicitly_configured("anthropic"):
@@ -1690,11 +1602,12 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 changed = True
             return changed, active_sources
 
-        from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
+        # Only Hermes owns this refresh-token lifecycle. Never auto-import
+        # Claude Code's keychain or credentials file, even for Anthropic users.
+        from agent.anthropic_adapter import read_hermes_oauth_credentials
 
         for source_name, creds in (
             ("hermes_pkce", read_hermes_oauth_credentials()),
-            ("claude_code", read_claude_code_credentials()),
         ):
             if creds and creds.get("accessToken"):
                 if _is_suppressed(provider, source_name):
@@ -2068,6 +1981,7 @@ def _prune_stale_seeded_entries(entries: List[PooledCredential], active_sources:
         for entry in entries
         if _is_manual_source(entry.source)
         or entry.source in active_sources
+        or (entry.provider == "anthropic" and entry.source == "claude_code")
         or not (
             is_borrowed_credential_source(entry.source, entry.provider)
             # Hermes PKCE is Hermes-owned/persistable while present, but it is

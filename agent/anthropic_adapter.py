@@ -915,42 +915,12 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
 
 
 def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
-    """Read refreshable Claude Code OAuth credentials.
+    """Compatibility hook: Claude Code's interactive login is never borrowed.
 
-    Checks two sources in order:
-      1. macOS Keychain (Darwin only) — "Claude Code-credentials" entry
-      2. ~/.claude/.credentials.json file
-
-    This intentionally excludes ~/.claude.json primaryApiKey. Opencode's
-    subscription flow is OAuth/setup-token based with refreshable credentials,
-    and native direct Anthropic provider usage should follow that path rather
-    than auto-detecting Claude's first-party managed key.
-
-    Returns dict with {accessToken, refreshToken?, expiresAt?} or None.
+    Hermes uses its own PKCE login or explicitly supplied host credentials.
+    Returning no credential also protects auxiliary clients and setup/status
+    paths which historically called this helper outside the credential pool.
     """
-    # Try macOS Keychain first (covers Claude Code >=2.1.114)
-    kc_creds = _read_claude_code_credentials_from_keychain()
-    if kc_creds:
-        return kc_creds
-
-    # Fall back to JSON file
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    if cred_path.exists():
-        try:
-            data = json.loads(cred_path.read_text(encoding="utf-8"))
-            oauth_data = data.get("claudeAiOauth")
-            if oauth_data and isinstance(oauth_data, dict):
-                access_token = oauth_data.get("accessToken", "")
-                if access_token:
-                    return {
-                        "accessToken": access_token,
-                        "refreshToken": oauth_data.get("refreshToken", ""),
-                        "expiresAt": oauth_data.get("expiresAt", 0),
-                        "source": "claude_code_credentials_file",
-                    }
-        except (json.JSONDecodeError, OSError, IOError) as e:
-            logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
-
     return None
 
 
@@ -1034,24 +1004,8 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
 
 
 def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
-    """Attempt to refresh an expired Claude Code OAuth token."""
-    refresh_token = creds.get("refreshToken", "")
-    if not refresh_token:
-        logger.debug("No refresh token available — cannot refresh")
-        return None
-
-    try:
-        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
-        _write_claude_code_credentials(
-            refreshed["access_token"],
-            refreshed["refresh_token"],
-            refreshed["expires_at_ms"],
-        )
-        logger.debug("Successfully refreshed Claude Code OAuth token")
-        return refreshed["access_token"]
-    except Exception as e:
-        logger.debug("Failed to refresh Claude Code token: %s", e)
-        return None
+    """Legacy borrowed-login refresh is disabled; it could log Claude Code out."""
+    return None
 
 
 def _write_claude_code_credentials(
@@ -1061,154 +1015,39 @@ def _write_claude_code_credentials(
     *,
     scopes: Optional[list] = None,
 ) -> None:
-    """Write refreshed credentials back to ~/.claude/.credentials.json.
-
-    The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
-    is persisted so that Claude Code's own auth check recognises the credential
-    as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
-    in the stored scopes before it will use the token.
-    """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    try:
-        # Read existing file to preserve other fields
-        existing = {}
-        if cred_path.exists():
-            existing = json.loads(cred_path.read_text(encoding="utf-8"))
-
-        oauth_data: Dict[str, Any] = {
-            "accessToken": access_token,
-            "refreshToken": refresh_token,
-            "expiresAt": expires_at_ms,
-        }
-        if scopes is not None:
-            oauth_data["scopes"] = scopes
-        elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
-            # Preserve previously-stored scopes when the refresh response
-            # does not include a scope field.
-            oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
-
-        existing["claudeAiOauth"] = oauth_data
-
-        cred_path.parent.mkdir(parents=True, exist_ok=True)
-        # Per-process random suffix avoids collisions between concurrent
-        # writers and stale leftovers from a prior crashed write.
-        _tmp_cred = cred_path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
-        try:
-            # Create the temp file atomically at 0o600. The previous
-            # write_text + post-replace chmod opened a TOCTOU window where
-            # both the temp file and the destination briefly inherited the
-            # process umask (commonly 0o644 = world-readable), exposing
-            # Claude Code OAuth tokens to other local users between create
-            # and chmod. Mirrors agent/google_oauth.py (#19673) and
-            # tools/mcp_oauth.py (#21148). Parent dir (~/.claude/) is
-            # owned by Claude Code itself, so we leave its mode alone.
-            fd = os.open(
-                str(_tmp_cred),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                stat.S_IRUSR | stat.S_IWUSR,
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(existing, fh, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(_tmp_cred, cred_path)
-        except OSError:
-            try:
-                _tmp_cred.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-    except (OSError, IOError) as e:
-        logger.debug("Failed to write refreshed credentials: %s", e)
+    """Refuse modification of another application's credential store."""
+    raise RuntimeError("Hermes does not modify Claude Code's login; use Hermes PKCE or explicit host credentials")
 
 
 def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Resolve a token from Claude Code credential files, refreshing if needed."""
-    creds = creds or read_claude_code_credentials()
-    if creds and is_claude_code_token_valid(creds):
-        logger.debug("Using Claude Code credentials (auto-detected)")
-        return creds["accessToken"]
-    if creds:
-        logger.debug("Claude Code credentials expired — attempting refresh")
-        refreshed = _refresh_oauth_token(creds)
-        if refreshed:
-            return refreshed
-        logger.debug("Token refresh failed — re-run 'claude setup-token' to reauthenticate")
+    """Legacy compatibility hook; borrowed Claude Code credentials are disabled."""
     return None
 
 
 def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Prefer Claude Code creds when a persisted env OAuth token would shadow refresh.
-
-    Hermes historically persisted setup tokens into ANTHROPIC_TOKEN. That makes
-    later refresh impossible because the static env token wins before we ever
-    inspect Claude Code's refreshable credential file. If we have a refreshable
-    Claude Code credential record, prefer it over the static env OAuth token.
-    """
-    if not env_token or not _is_oauth_token(env_token) or not isinstance(creds, dict):
-        return None
-    if not creds.get("refreshToken"):
-        return None
-
-    resolved = _resolve_claude_code_token_from_credentials(creds)
-    if resolved and resolved != env_token:
-        logger.debug(
-            "Preferring Claude Code credential file over static env OAuth token so refresh can proceed"
-        )
-        return resolved
+    """Never replace an explicit host token with Claude Code's rotating login."""
     return None
 
 
 def resolve_anthropic_token() -> Optional[str]:
-    """Resolve an Anthropic token from all available sources.
+    """Resolve only explicitly supplied host credentials.
 
-    Priority:
-      1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
-      2. CLAUDE_CODE_OAUTH_TOKEN env var
-      3. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
-         — with automatic refresh if expired and a refresh token is available
-      4. ANTHROPIC_API_KEY env var (regular API key, or legacy fallback)
-
-    Returns the token string or None.
+    Hermes-owned PKCE credentials are resolved through the credential pool.
+    Claude Code's rotating login belongs to Claude Code: reading or refreshing
+    it here can revoke the login used by that application on the same machine.
     """
-    creds = read_claude_code_credentials()
-
-    # 1. Hermes-managed OAuth/setup token env var
-    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
-    if token:
-        preferred = _prefer_refreshable_claude_code_token(token, creds)
-        if preferred:
-            return preferred
-        return token
-
-    # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-    if cc_token:
-        preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
-        if preferred:
-            return preferred
-        return cc_token
-
-    # 3. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
-    if resolved_claude_token:
-        return resolved_claude_token
-
-    # 4. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
-    # This remains as a compatibility fallback for pre-migration Hermes configs.
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if api_key:
-        return api_key
-
+    for name in ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        token = os.getenv(name, "").strip()
+        if token:
+            return token
     return None
 
 
 def run_oauth_setup_token() -> Optional[str]:
     """Run 'claude setup-token' interactively and return the resulting token.
 
-    Checks multiple sources after the subprocess completes:
-      1. Claude Code credential files (may be written by the subprocess)
-      2. CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_TOKEN env vars
+    Checks explicit CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_TOKEN environment
+    variables after the subprocess completes. Never reads Claude Code's login.
 
     Returns the token string, or None if no credentials were obtained.
     Raises FileNotFoundError if the 'claude' CLI is not installed.
@@ -1232,11 +1071,8 @@ def run_oauth_setup_token() -> Optional[str]:
     except (KeyboardInterrupt, EOFError):
         return None
 
-    # Check if credentials were saved to Claude Code's config files
-    creds = read_claude_code_credentials()
-    if creds and is_claude_code_token_valid(creds):
-        return creds["accessToken"]
-
+    # setup-token does not authorize borrowing Claude Code's rotating login.
+    # Only an explicitly supplied setup token may enter Hermes through this path.
     # Check env vars that may have been set
     for env_var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_TOKEN"):
         val = os.getenv(env_var, "").strip()

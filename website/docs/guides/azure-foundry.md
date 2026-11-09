@@ -247,7 +247,7 @@ Important behaviour:
 - **`api-version` is sent via `default_query`, not appended to the URL.** Azure Anthropic requires an `api-version` query string. Baking it into the base URL produces malformed paths like `/anthropic?api-version=.../v1/messages` and returns 404. Hermes passes `api-version=2025-04-15` via the Anthropic SDK's `default_query` instead.
 - **Bearer auth is used instead of `x-api-key`.** Azure's Anthropic-compatible route requires `Authorization: Bearer <key>` rather than Anthropic's native `x-api-key` header. Hermes detects `azure.com` in the base URL and routes the API key through the SDK's `auth_token` field so the right header reaches the upstream.
 - **1M context window beta header is kept.** Azure still gates the 1M-token Claude context (Opus 4.6/4.7, Sonnet 4.6) behind the `anthropic-beta: context-1m-2025-08-07` header. Hermes keeps that beta header on Azure paths (it's stripped from native Anthropic OAuth requests because some subscriptions reject it, but Azure requires it).
-- **OAuth token refresh is disabled.** Azure deployments use static API keys. The `~/.claude/.credentials.json` OAuth token refresh loop that applies to Anthropic Console is explicitly skipped for Azure endpoints to prevent the Claude Code OAuth token from overwriting your Azure key mid-session.
+- **OAuth token refresh is disabled.** Azure deployments use static API keys. Hermes does not borrow Claude Code OAuth credentials. Azure endpoints use their explicitly configured key without an OAuth refresh loop.
 
 ## Alternative: `provider: anthropic` + Azure base URL
 
@@ -261,7 +261,7 @@ model:
   default: claude-sonnet-4-6
 ```
 
-With `AZURE_ANTHROPIC_KEY` set in `~/.hermes/.env`. Hermes detects `azure.com` in the base URL and short-circuits around the Claude Code OAuth token chain so the Azure key is used directly with `x-api-key` auth.
+With `AZURE_ANTHROPIC_KEY` set in `~/.hermes/.env`. Hermes detects `azure.com` in the base URL and uses the explicitly configured Azure credential so the Azure key is used directly with `x-api-key` auth.
 
 `key_env` is the canonical snake_case field name; `api_key_env` (and the camelCase `keyEnv` / `apiKeyEnv`) are accepted as aliases. If both `key_env` and `AZURE_ANTHROPIC_KEY`/`ANTHROPIC_API_KEY` are set, the `key_env`-named env var wins.
 

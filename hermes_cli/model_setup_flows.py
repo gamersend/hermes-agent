@@ -2590,7 +2590,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         print("No change.")
 
 def _model_flow_anthropic(config, current_model=""):
-    """Flow for Anthropic provider — OAuth subscription, API key, or Claude Code creds."""
+    """Flow for explicit host setup tokens or an Anthropic API key."""
     from hermes_cli.main import _run_anthropic_oauth_flow
     from hermes_cli.auth import (
         _prompt_model_selection,
@@ -2605,32 +2605,13 @@ def _model_flow_anthropic(config, current_model=""):
     )
     from hermes_cli.models import _PROVIDER_MODELS
 
-    # Check ALL credential sources
+    # An explicitly provisioned host token remains usable independently of
+    # Claude Code's login. Token shape alone supplies no expiry information;
+    # let the operator choose re-authentication after an actual auth failure.
     from hermes_cli.auth import get_anthropic_key
 
     existing_key = get_anthropic_key()
-    cc_available = False
-    try:
-        from agent.anthropic_adapter import (
-            read_claude_code_credentials,
-            is_claude_code_token_valid,
-            _is_oauth_token,
-        )
-
-        cc_creds = read_claude_code_credentials()
-        if cc_creds and is_claude_code_token_valid(cc_creds):
-            cc_available = True
-    except Exception:
-        pass
-
-    # Stale-OAuth guard: if the only existing cred is an expired OAuth token
-    # (no valid cc_creds to fall back on), treat it as missing so the re-auth
-    # path is offered instead of silently accepting a broken token.
-    existing_is_stale_oauth = False
-    if existing_key and _is_oauth_token(existing_key) and not cc_available:
-        existing_is_stale_oauth = True
-
-    has_creds = (bool(existing_key) and not existing_is_stale_oauth) or cc_available
+    has_creds = bool(existing_key)
     needs_auth = not has_creds
 
     if has_creds:
@@ -2650,10 +2631,8 @@ def _model_flow_anthropic(config, current_model=""):
                     if source_suffix:
                         break
             print(
-                f"  Anthropic credentials: {existing_key[:12]}... ✓{source_suffix}"
+                f"  Anthropic credentials: ✓{source_suffix}"
             )
-        elif cc_available:
-            print("  Claude Code credentials: ✓ (auto-detected)")
         print()
         choice = _prompt_auth_credentials_choice("Anthropic credentials:")
 

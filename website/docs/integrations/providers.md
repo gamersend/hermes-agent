@@ -120,18 +120,18 @@ export ANTHROPIC_API_KEY=***
 hermes chat --provider anthropic --model claude-sonnet-4-6
 
 # Preferred: authenticate through `hermes model`
-# Hermes will use Claude Code's credential store directly when available
+# Configure an independent setup-token or API key for this host
 hermes model
 
-# Manual override with a setup-token (fallback / legacy)
-export ANTHROPIC_TOKEN=***  # setup-token or manual OAuth token
-hermes chat --provider anthropic
+# Hermes-native PKCE (separate from Claude Code's login)
+hermes auth add anthropic --type oauth
 
-# Auto-detect Claude Code credentials (if you already use Claude Code)
-hermes chat --provider anthropic  # reads Claude Code credential files automatically
+# Explicit per-host setup-token
+export ANTHROPIC_TOKEN=***  # a separate setup-token for this host
+hermes chat --provider anthropic
 ```
 
-When you choose Anthropic OAuth through `hermes model`, Hermes prefers Claude Code's own credential store over copying the token into `~/.hermes/.env`. That keeps refreshable Claude credentials refreshable.
+Hermes uses its own PKCE sign-in or an explicit host-only setup token/API key. It never imports, refreshes or writes Claude Code's interactive login. Old `claude_code` pool records cannot be selected or refreshed. Keep separate logins for each host, agent and gateway; never copy an interactive credential file or keychain item.
 
 Or set it permanently:
 ```yaml
